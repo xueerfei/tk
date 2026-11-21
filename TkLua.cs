@@ -60,16 +60,19 @@ class TkLua
         " r[#r+1]=\"石头=\"..f(Sidl.TK.MaterialType.Stone)" +
         " r[#r+1]=\"铁块=\"..f(Sidl.TK.MaterialType.Iron)" +
         " r[#r+1]=\"马匹=\"..f(Sidl.TK.MaterialType.Horse)" +
+        " r[#r+1]=\"预备兵=\"..tostring(GU.GetFactionAllReservist(fid))" +
         " r[#r+1]=\"金钱=\"..f(Sidl.TK.MaterialType.Money)" +
         " r[#r+1]=\"策略点=\"..tostring(fi.StrategemPoints)" +
         " return table.concat(r,\"  \")" +
         " end)()";
 
-    // 资源全满: 木材/石头/铁块/马匹/金钱 -> 9999999, 粮食按地点分配
+    // 资源全满: 木材/石头/铁块/马匹/金钱 -> 9999999, 粮食每城补至99999(超出不减), 粮仓补至999999
     const string SET_ALL_RES_EXPR =
         "(function()" +
         " local PL=(package and package.loaded) or {}" +
         " local GU=PL[\"Gameplay.GameplayUtil\"] or require(\"Gameplay.GameplayUtil\")" +
+        " local GO=PL[\"Gameplay.GameplayOperation\"]" +
+        " if GO == nil then if pcall(require, \"Gameplay.GameplayOperation\") then GO = require(\"Gameplay.GameplayOperation\") end end" +
         " local ctx=GU.GetContext()" +
         " local fid=ctx.SelfFactionId" +
         " local fi=ctx.Model.Factions[fid]" +
@@ -84,12 +87,25 @@ class TkLua
         "  r[#r+1]=tostring(old)..\" -> \"..tostring(GU.GetFactionMaterialNum(fid,mid))" +
         " end" +
         " local oldFood=GU.GetFactionAllFood(fid)" +
-        " local first=true" +
+        " local foodCap=GU.SiteLimitFood or 99999" +
+        " local foodN=0" +
         " for siteId,_ in pairs(fi.Sites) do" +
         "  local si=GU.GetSiteInfo(siteId)" +
-        "  if first then si.Food=v first=false else si.Food=0 end" +
+        "  if si ~= nil and si.FactionId == fid and si.Food < foodCap then" +
+        "   if GO ~= nil and GO.ChangeSiteFoodNum ~= nil then" +
+        "    GO.ChangeSiteFoodNum(siteId, foodCap - si.Food, false, true)" +
+        "   else" +
+        "    si.Food = foodCap" +
+        "   end" +
+        "   foodN = foodN + 1" +
+        "  end" +
         " end" +
-        " r[#r+1]=\"粮食 \"..tostring(oldFood)..\" -> \"..tostring(GU.GetFactionAllFood(fid))" +
+        " if GO ~= nil and GO.ChangeFactionCommonFoodNum ~= nil then" +
+        "  GO.ChangeFactionCommonFoodNum(fid, 999999)" +
+        " else" +
+        "  fi.CommonFood = 999999" +
+        " end" +
+        " r[#r+1]=\"粮食(每城补至\"..tostring(foodCap)..\", 已改\"..tostring(foodN)..\"城, 超出不减+粮仓) \"..tostring(oldFood)..\" -> \"..tostring(GU.GetFactionAllFood(fid))" +
         " return table.concat(r,\"  \")" +
         " end)()";
 
@@ -108,22 +124,30 @@ class TkLua
         " return \"{0} OLD=\" .. tostring(old) .. \" -> NEW=\" .. tostring(GU.GetFactionMaterialNum(fid,mid))" +
         " end)()";
 
-    // 修改粮食 ({0}=目标值): 全部地点清零, 第一个地点设为目标值 (显示值=各地之和)
+    // 修改粮食 ({0}=目标值): 只把低于目标值的城补到目标值, 高于目标值的城不动(不削减), 可重复执行 (幂等)
     const string SET_FOOD_EXPR =
         "(function()" +
         " local PL=(package and package.loaded) or {{}}" +
         " local GU=PL[\"Gameplay.GameplayUtil\"] or require(\"Gameplay.GameplayUtil\")" +
+        " local GO=PL[\"Gameplay.GameplayOperation\"]" +
+        " if GO == nil then if pcall(require, \"Gameplay.GameplayOperation\") then GO = require(\"Gameplay.GameplayOperation\") end end" +
         " local ctx=GU.GetContext()" +
         " local fid=ctx.SelfFactionId" +
         " local fi=ctx.Model.Factions[fid]" +
         " local v=math.clamp({0},0,99999999)" +
-        " local old=GU.GetFactionAllFood(fid)" +
-        " local first=true" +
+        " local n=0" +
         " for siteId,_ in pairs(fi.Sites) do" +
         "  local si=GU.GetSiteInfo(siteId)" +
-        "  if first then si.Food=v first=false else si.Food=0 end" +
+        "  if si ~= nil and si.FactionId == fid and si.Food < v then" +
+        "   if GO ~= nil and GO.ChangeSiteFoodNum ~= nil then" +
+        "    GO.ChangeSiteFoodNum(siteId, v - si.Food, true, true)" +
+        "   else" +
+        "    si.Food = v" +
+        "   end" +
+        "   n = n + 1" +
+        "  end" +
         " end" +
-        " return \"粮食 OLD=\" .. tostring(old) .. \" -> NEW=\" .. tostring(GU.GetFactionAllFood(fid))" +
+        " return \"粮食: 每城补到=\" .. tostring(v) .. \" (低于该值的城, 已改\" .. tostring(n) .. \"城, 超出不减) 总计=\" .. tostring(GU.GetFactionAllFood(fid))" +
         " end)()";
 
     // 修改金钱 ({0}=目标值, 金钱存在 fi.Money 而非 Materials)
@@ -136,6 +160,36 @@ class TkLua
         " local v=math.clamp({0},0,99999999)" +
         " local old=fi.Money fi.Money=v" +
         " return \"金钱 OLD=\" .. tostring(old) .. \" -> NEW=\" .. tostring(fi.Money)" +
+        " end)()";
+
+    // 修改预备兵 ({0}=目标值): 每城上限=人口10%(各不相同), 不超上限, 可重复执行 (幂等), 通用预备兵不动
+    const string SET_RESERVIST_EXPR =
+        "(function()" +
+        " local PL=(package and package.loaded) or {{}}" +
+        " local GU=PL[\"Gameplay.GameplayUtil\"] or require(\"Gameplay.GameplayUtil\")" +
+        " local GO=PL[\"Gameplay.GameplayOperation\"]" +
+        " if GO == nil then if pcall(require, \"Gameplay.GameplayOperation\") then GO = require(\"Gameplay.GameplayOperation\") end end" +
+        " local ctx=GU.GetContext()" +
+        " local fid=ctx.SelfFactionId" +
+        " local fi=ctx.Model.Factions[fid]" +
+        " local v=math.clamp({0},0,99999999)" +
+        " local n=0" +
+        " for siteId,_ in pairs(fi.Sites) do" +
+        "  local si=GU.GetSiteInfo(siteId)" +
+        "  if si ~= nil and si.FactionId == fid then" +
+        "   local limit=math.floor(si.Population/10)" +
+        "   local target=math.min(v,limit)" +
+        "   if si.Reservist ~= target then" +
+        "    if GO ~= nil and GO.ChangeSiteReservist ~= nil then" +
+        "     GO.ChangeSiteReservist(siteId, target - si.Reservist, false)" +
+        "    else" +
+        "     si.Reservist = target" +
+        "    end" +
+        "    n = n + 1" +
+        "   end" +
+        "  end" +
+        " end" +
+        " return \"预备兵: 目标=\" .. tostring(v) .. \" (每城上限=人口10%, 已改\" .. tostring(n) .. \"城) 总计=\" .. tostring(GU.GetFactionAllReservist(fid))" +
         " end)()";
 
     // initSuccess 握手消息: 客户端处理函数会直接解引用 info 下大量字段
@@ -280,10 +334,24 @@ class TkLua
         if (i < 0) return null;
         i++;
         while (i < json.Length && json[i] == ' ') i++;
-        int end = json.IndexOf(',', i);
-        if (end < 0) end = json.IndexOf('}', i);
-        if (end < 0) end = json.Length;
-        return json.Substring(i, end - i).Trim();
+        // 取到 ',' 或 '}' 为止, 跳过引号内的字符(值本身可能含 , 或 } )
+        // 注: Lua 表的 JSON 序列化字段顺序不定, isSuccess 可能是最后一个字段,
+        //     旧实现只认 ',' 会把 "true"} 整个拿走导致成功被误判为失败
+        int j = i;
+        bool inStr = false;
+        for (; j < json.Length; j++)
+        {
+            char c = json[j];
+            if (c == '"')
+            {
+                if (j == i || json[j - 1] != '\\') inStr = !inStr;
+            }
+            else if (!inStr && (c == ',' || c == '}'))
+            {
+                break;
+            }
+        }
+        return json.Substring(i, j - i).Trim();
     }
 
     static string Unquote(string s)
@@ -337,6 +405,7 @@ class TkLua
         Log(">> 游戏已暂停, 开始执行表达式...");
 
         // 游戏暂停时调用栈才建立; stackId=2 是最内层用户帧, 依次探测 2~10
+        bool sawWrong = false, sawOther = false;
         for (int st = 2; st <= 10; st++)
         {
             string id = (cb++).ToString();
@@ -360,6 +429,8 @@ class TkLua
                     try { val = Encoding.UTF8.GetString(Convert.FromBase64String(val)); }
                     catch { }
                 }
+                if (val.IndexOf("输入了错误的变量信息") >= 0) sawWrong = true;
+                else sawOther = true;
             }
             if (isSuc == "true" || isSuc == "\"true\"")
             {
@@ -378,6 +449,8 @@ class TkLua
         string c2 = (cb++).ToString();
         Send("{\"cmd\":\"continue\",\"callbackId\":\"" + c2 + "\",\"info\":{}}");
         Log("!! 执行失败 (所有 stackId 均未成功), 游戏已恢复运行; 详情见 TkLua.log");
+        if (sawWrong && !sawOther)
+            Log("!! 提示: 游戏环境尚未初始化(刚开新档/还没打开过面板), 请在游戏里加载存档并打开一次面板后再点按钮");
         return false;
     }
 
@@ -428,11 +501,12 @@ class TkLua
             Console.WriteLine("");
             Console.WriteLine("====== 命令菜单 ======");
             Console.WriteLine(" 1. 策略点数 -> 9999");
-            Console.WriteLine(" 2. 资源全满 (粮食/木材/石头/铁块/马匹/金钱 -> 9999999)");
+            Console.WriteLine(" 2. 资源全满 (木材/石头/铁块/马匹/金钱 -> 9999999, 粮食每城补至99999, 超出不减, 粮仓999999)");
             Console.WriteLine(" 3. 查看当前资源 (含策略点)");
             Console.WriteLine(" 4. 修改单个资源");
             Console.WriteLine(" 5. 策略点数 -> 自定义数值");
             Console.WriteLine(" 6. 自定义 Lua 表达式");
+            Console.WriteLine(" 7. 预备兵每城 -> 自定义数值 (不超该城人口10%上限)");
             Console.WriteLine(" 0. 退出");
             Console.Write("输入序号: ");
             string cmd = Console.ReadLine();
@@ -455,20 +529,22 @@ class TkLua
                 }
                 else if (cmd == "4")
                 {
-                    Console.WriteLine(" 1=粮食 2=木材 3=石头 4=铁块 5=马匹 6=金钱");
+                    Console.WriteLine(" 1=粮食 2=木材 3=石头 4=铁块 5=马匹 6=金钱 7=预备兵");
                     Console.Write("输入 \"资源序号 数值\" (如: 2 50000): ");
                     string line = Console.ReadLine();
                     string[] parts = (line ?? "").Trim().Split(' ');
                     int ri; long n;
-                    if (parts.Length >= 2 && int.TryParse(parts[0], out ri) && long.TryParse(parts[1], out n) && ri >= 1 && ri <= 6)
+                    if (parts.Length >= 2 && int.TryParse(parts[0], out ri) && long.TryParse(parts[1], out n) && ri >= 1 && ri <= 7)
                     {
                         string[] enumNames = { "Food", "Wood", "Stone", "Iron", "Horse", "Money" };
-                        string[] labels = { "粮食", "木材", "石头", "铁块", "马匹", "金钱" };
+                        string[] labels = { "粮食", "木材", "石头", "铁块", "马匹", "金钱", "预备兵" };
                         string label = labels[ri - 1];
                         if (ri == 1)
                             StopAndEval(string.Format(SET_FOOD_EXPR, n), label + "=" + n);
                         else if (ri == 6)
                             StopAndEval(string.Format(SET_MONEY_EXPR, n), label + "=" + n);
+                        else if (ri == 7)
+                            StopAndEval(string.Format(SET_RESERVIST_EXPR, n), label + "=" + n);
                         else
                             StopAndEval(string.Format(SET_MATERIAL_EXPR, enumNames[ri - 1], n), label + "=" + n);
                     }
@@ -491,6 +567,16 @@ class TkLua
                     string expr = Console.ReadLine();
                     if (expr != null && expr.Trim().Length > 0)
                         StopAndEval(expr, "自定义表达式");
+                }
+                else if (cmd == "7")
+                {
+                    Console.Write("输入每城预备兵目标值 (超上限自动按上限填): ");
+                    string v = Console.ReadLine();
+                    long n;
+                    if (v != null && long.TryParse(v.Trim(), out n))
+                        StopAndEval(string.Format(SET_RESERVIST_EXPR, n.ToString()), "预备兵每城=" + n);
+                    else
+                        Log("!! 输入的不是数字");
                 }
                 else
                 {

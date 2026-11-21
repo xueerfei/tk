@@ -74,6 +74,7 @@ class RPanel : Panel
         {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
+            if (Width < 2 || Height < 2) return;
             Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
             using (GraphicsPath pr = UI.RRect(r, 12))
             {
@@ -141,6 +142,7 @@ class NavItem : Control
     {
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
+        if (Width < 2 || Height < 2) return;
         Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
         if (Active)
         {
@@ -289,6 +291,7 @@ class MainForm : Form
         " r[#r+1]=\"石头=\"..f(Sidl.TK.MaterialType.Stone)" +
         " r[#r+1]=\"铁块=\"..f(Sidl.TK.MaterialType.Iron)" +
         " r[#r+1]=\"马匹=\"..f(Sidl.TK.MaterialType.Horse)" +
+        " r[#r+1]=\"预备兵=\"..tostring(GU.GetFactionAllReservist(fid))" +
         " r[#r+1]=\"策略点=\"..tostring(fi.StrategemPoints)" +
         " return table.concat(r,\"  \")" +
         " end)()";
@@ -308,6 +311,8 @@ class MainForm : Form
         "(function()" +
         " local PL=(package and package.loaded) or {}" +
         " local GU=PL[\"Gameplay.GameplayUtil\"] or require(\"Gameplay.GameplayUtil\")" +
+        " local GO=PL[\"Gameplay.GameplayOperation\"]" +
+        " if GO == nil then if pcall(require, \"Gameplay.GameplayOperation\") then GO = require(\"Gameplay.GameplayOperation\") end end" +
         " local ctx=GU.GetContext()" +
         " local fid=ctx.SelfFactionId" +
         " local fi=ctx.Model.Factions[fid]" +
@@ -322,12 +327,25 @@ class MainForm : Form
         "  r[#r+1]=tostring(old)..\" -> \"..tostring(GU.GetFactionMaterialNum(fid,mid))" +
         " end" +
         " local oldFood=GU.GetFactionAllFood(fid)" +
-        " local first=true" +
+        " local foodCap=GU.SiteLimitFood or 99999" +
+        " local foodN=0" +
         " for siteId,_ in pairs(fi.Sites) do" +
         "  local si=GU.GetSiteInfo(siteId)" +
-        "  if first then si.Food=v first=false else si.Food=0 end" +
+        "  if si ~= nil and si.FactionId == fid and si.Food < foodCap then" +
+        "   if GO ~= nil and GO.ChangeSiteFoodNum ~= nil then" +
+        "    GO.ChangeSiteFoodNum(siteId, foodCap - si.Food, false, true)" +
+        "   else" +
+        "    si.Food = foodCap" +
+        "   end" +
+        "   foodN = foodN + 1" +
+        "  end" +
         " end" +
-        " r[#r+1]=\"粮食 \"..tostring(oldFood)..\" -> \"..tostring(GU.GetFactionAllFood(fid))" +
+        " if GO ~= nil and GO.ChangeFactionCommonFoodNum ~= nil then" +
+        "  GO.ChangeFactionCommonFoodNum(fid, 999999)" +
+        " else" +
+        "  fi.CommonFood = 999999" +
+        " end" +
+        " r[#r+1]=\"粮食(每城补至\"..tostring(foodCap)..\", 已改\"..tostring(foodN)..\"城, 超出不减+粮仓) \"..tostring(oldFood)..\" -> \"..tostring(GU.GetFactionAllFood(fid))" +
         " return table.concat(r,\"  \")" +
         " end)()";
 
@@ -349,17 +367,25 @@ class MainForm : Form
         "(function()" +
         " local PL=(package and package.loaded) or {{}}" +
         " local GU=PL[\"Gameplay.GameplayUtil\"] or require(\"Gameplay.GameplayUtil\")" +
+        " local GO=PL[\"Gameplay.GameplayOperation\"]" +
+        " if GO == nil then if pcall(require, \"Gameplay.GameplayOperation\") then GO = require(\"Gameplay.GameplayOperation\") end end" +
         " local ctx=GU.GetContext()" +
         " local fid=ctx.SelfFactionId" +
         " local fi=ctx.Model.Factions[fid]" +
         " local v=math.clamp({0},0,99999999)" +
-        " local old=GU.GetFactionAllFood(fid)" +
-        " local first=true" +
+        " local n=0" +
         " for siteId,_ in pairs(fi.Sites) do" +
         "  local si=GU.GetSiteInfo(siteId)" +
-        "  if first then si.Food=v first=false else si.Food=0 end" +
+        "  if si ~= nil and si.FactionId == fid and si.Food < v then" +
+        "   if GO ~= nil and GO.ChangeSiteFoodNum ~= nil then" +
+        "    GO.ChangeSiteFoodNum(siteId, v - si.Food, true, true)" +
+        "   else" +
+        "    si.Food = v" +
+        "   end" +
+        "   n = n + 1" +
+        "  end" +
         " end" +
-        " return \"粮食 OLD=\" .. tostring(old) .. \" -> NEW=\" .. tostring(GU.GetFactionAllFood(fid))" +
+        " return \"粮食: 每城补到=\" .. tostring(v) .. \" (低于该值的城, 已改\" .. tostring(n) .. \"城, 超出不减) 总计=\" .. tostring(GU.GetFactionAllFood(fid))" +
         " end)()";
 
     const string SET_MONEY_EXPR =
@@ -371,6 +397,36 @@ class MainForm : Form
         " local v=math.clamp({0},0,99999999)" +
         " local old=fi.Money fi.Money=v" +
         " return \"金钱 OLD=\" .. tostring(old) .. \" -> NEW=\" .. tostring(fi.Money)" +
+        " end)()";
+
+    // 修改预备兵 ({0}=目标值): 每城上限=人口10%(各不相同), 不超上限, 可重复执行 (幂等), 通用预备兵不动
+    const string SET_RESERVIST_EXPR =
+        "(function()" +
+        " local PL=(package and package.loaded) or {{}}" +
+        " local GU=PL[\"Gameplay.GameplayUtil\"] or require(\"Gameplay.GameplayUtil\")" +
+        " local GO=PL[\"Gameplay.GameplayOperation\"]" +
+        " if GO == nil then if pcall(require, \"Gameplay.GameplayOperation\") then GO = require(\"Gameplay.GameplayOperation\") end end" +
+        " local ctx=GU.GetContext()" +
+        " local fid=ctx.SelfFactionId" +
+        " local fi=ctx.Model.Factions[fid]" +
+        " local v=math.clamp({0},0,99999999)" +
+        " local n=0" +
+        " for siteId,_ in pairs(fi.Sites) do" +
+        "  local si=GU.GetSiteInfo(siteId)" +
+        "  if si ~= nil and si.FactionId == fid then" +
+        "   local limit=math.floor(si.Population/10)" +
+        "   local target=math.min(v,limit)" +
+        "   if si.Reservist ~= target then" +
+        "    if GO ~= nil and GO.ChangeSiteReservist ~= nil then" +
+        "     GO.ChangeSiteReservist(siteId, target - si.Reservist, false)" +
+        "    else" +
+        "     si.Reservist = target" +
+        "    end" +
+        "    n = n + 1" +
+        "   end" +
+        "  end" +
+        " end" +
+        " return \"预备兵: 目标=\" .. tostring(v) .. \" (每城上限=人口10%, 已改\" .. tostring(n) .. \"城) 总计=\" .. tostring(GU.GetFactionAllReservist(fid))" +
         " end)()";
 
     const string INIT_SUCCESS =
@@ -438,8 +494,15 @@ class MainForm : Form
 
     protected override void OnPaintBackground(PaintEventArgs e)
     {
-        using (LinearGradientBrush b = new LinearGradientBrush(ClientRectangle, Color.FromArgb(7, 15, 30), Color.FromArgb(3, 7, 15), 90f))
-            e.Graphics.FillRectangle(b, ClientRectangle);
+        // 最小化/恢复等瞬间 ClientRectangle 可能为 0x0, 此时创建渐变画刷会抛 ArgumentException
+        Rectangle rc = ClientRectangle;
+        if (rc.Width <= 0 || rc.Height <= 0)
+        {
+            base.OnPaintBackground(e);
+            return;
+        }
+        using (LinearGradientBrush b = new LinearGradientBrush(rc, Color.FromArgb(7, 15, 30), Color.FromArgb(3, 7, 15), 90f))
+            e.Graphics.FillRectangle(b, rc);
     }
 
     void BuildUi()
@@ -526,7 +589,7 @@ class MainForm : Form
 
         // F1~F6 圆形快捷键 (中央面板底部, 所有页共用)
         AddKey(0, "◆", "F1", "点数", delegate { DoPoints(9999); });
-        AddKey(1, "★", "F2", "全满", delegate { Exec(SET_ALL_RES_EXPR, "资源全满=9999999"); });
+        AddKey(1, "★", "F2", "全满", delegate { Exec(SET_ALL_RES_EXPR, "资源全满 (粮食至上限)"); });
         AddKey(2, "◉", "F3", "查询", delegate { DoQuery(); });
         AddKey(3, "▣", "F4", "单项", delegate { DoRes(); });
         AddKey(4, "✎", "F5", "自定义", delegate { DoPoints(0); });
@@ -591,10 +654,10 @@ class MainForm : Form
         // 2 资源
         Panel pg2 = centerPages[2];
         RButton b2 = new RButton();
-        b2.Text = "资源全满 9999999   [F2]";
+        b2.Text = "资源全满 (粮食补到上限)   [F2]";
         b2.Size = new Size(260, 46);
         b2.Location = new Point(93, 36);
-        b2.Click += delegate { Exec(SET_ALL_RES_EXPR, "资源全满=9999999"); };
+        b2.Click += delegate { Exec(SET_ALL_RES_EXPR, "资源全满 (粮食至上限)"); };
         pg2.Controls.Add(b2);
         Label l2 = new Label();
         l2.Text = "单项修改";
@@ -609,7 +672,7 @@ class MainForm : Form
         cmbRes.Font = UI.F9;
         cmbRes.BackColor = UI.INBG;
         cmbRes.ForeColor = UI.WHITE;
-        cmbRes.Items.AddRange(new object[] { "粮食", "木材", "石头", "铁块", "马匹", "金钱" });
+        cmbRes.Items.AddRange(new object[] { "粮食", "木材", "石头", "铁块", "马匹", "金钱", "预备兵" });
         cmbRes.SelectedIndex = 0;
         cmbRes.Location = new Point(136, 110);
         cmbRes.Width = 88;
@@ -625,12 +688,18 @@ class MainForm : Form
         b2b.Click += delegate { DoRes(); };
         pg2.Controls.Add(b2b);
         Label h2 = new Label();
-        h2.Text = "提示: 粮食为全国站点之和, 修改时集中写入第一个站点";
+        h2.Text = "提示: 资源全满粮食每城补至99999(超出不减); 预备兵每城不超该城人口10%上限";
         h2.ForeColor = UI.DIM;
         h2.Font = UI.F8;
         h2.Location = new Point(20, 164);
         h2.AutoSize = true;
         pg2.Controls.Add(h2);
+        RButton b2c = new RButton();
+        b2c.Text = "预备兵每城补满 (至人口10%上限)";
+        b2c.Size = new Size(260, 40);
+        b2c.Location = new Point(93, 196);
+        b2c.Click += delegate { Exec(string.Format(SET_RESERVIST_EXPR, "99999999"), "预备兵每城补满"); };
+        pg2.Controls.Add(b2c);
 
         // 3 高级 Lua
         Panel pg3 = centerPages[3];
@@ -658,21 +727,21 @@ class MainForm : Form
         rightBox.Location = new Point(658, 88);
         rightBox.Size = new Size(228, 448);
         Controls.Add(rightBox);
-        string[] keys = { "金钱", "粮食", "木材", "石头", "铁块", "马匹", "策略点" };
+        string[] keys = { "金钱", "粮食", "木材", "石头", "铁块", "马匹", "预备兵", "策略点" };
         for (int i = 0; i < keys.Length; i++)
         {
             Label lk = new Label();
             lk.Text = keys[i];
             lk.ForeColor = UI.DIM;
             lk.Font = UI.F10;
-            lk.Location = new Point(18, 48 + i * 42);
+            lk.Location = new Point(18, 44 + i * 38);
             lk.AutoSize = true;
             rightBox.Controls.Add(lk);
             Label lv = new Label();
             lv.Text = "—";
             lv.ForeColor = UI.CYAN;
             lv.Font = UI.FCONB;
-            lv.Location = new Point(106, 48 + i * 42);
+            lv.Location = new Point(106, 44 + i * 38);
             lv.Size = new Size(108, 24);
             lv.TextAlign = ContentAlignment.MiddleRight;
             rightBox.Controls.Add(lv);
@@ -770,10 +839,11 @@ class MainForm : Form
         long n;
         if (!long.TryParse(txtResVal.Text.Trim(), out n)) { Log("!! 请输入有效数字"); return; }
         string[] names = { "Food", "Wood", "Stone", "Iron", "Horse", "Money" };
-        string[] labels = { "粮食", "木材", "石头", "铁块", "马匹", "金钱" };
+        string[] labels = { "粮食", "木材", "石头", "铁块", "马匹", "金钱", "预备兵" };
         string label = labels[ri - 1];
         if (ri == 1) Exec(string.Format(SET_FOOD_EXPR, n), label + "=" + n);
         else if (ri == 6) Exec(string.Format(SET_MONEY_EXPR, n), label + "=" + n);
+        else if (ri == 7) Exec(string.Format(SET_RESERVIST_EXPR, n), label + "=" + n);
         else Exec(string.Format(SET_MATERIAL_EXPR, names[ri - 1], n), label + "=" + n);
     }
 
@@ -794,7 +864,7 @@ class MainForm : Form
         switch (e.KeyCode)
         {
             case Keys.F1: DoPoints(9999); e.Handled = true; break;
-            case Keys.F2: Exec(SET_ALL_RES_EXPR, "资源全满=9999999"); e.Handled = true; break;
+            case Keys.F2: Exec(SET_ALL_RES_EXPR, "资源全满 (粮食至上限)"); e.Handled = true; break;
             case Keys.F3: DoQuery(); e.Handled = true; break;
             case Keys.F4: DoRes(); e.Handled = true; break;
             case Keys.F5: DoPoints(0); e.Handled = true; break;
@@ -983,10 +1053,24 @@ class MainForm : Form
         if (i < 0) return null;
         i++;
         while (i < json.Length && json[i] == ' ') i++;
-        int end = json.IndexOf(',', i);
-        if (end < 0) end = json.IndexOf('}', i);
-        if (end < 0) end = json.Length;
-        return json.Substring(i, end - i).Trim();
+        // 取到 ',' 或 '}' 为止, 跳过引号内的字符(值本身可能含 , 或 } )
+        // 注: Lua 表的 JSON 序列化字段顺序不定, isSuccess 可能是最后一个字段,
+        //     旧实现只认 ',' 会把 "true"} 整个拿走导致成功被误判为失败
+        int j = i;
+        bool inStr = false;
+        for (; j < json.Length; j++)
+        {
+            char c = json[j];
+            if (c == '"')
+            {
+                if (j == i || json[j - 1] != '\\') inStr = !inStr;
+            }
+            else if (!inStr && (c == ',' || c == '}'))
+            {
+                break;
+            }
+        }
+        return json.Substring(i, j - i).Trim();
     }
 
     static string Unquote(string s)
@@ -1037,6 +1121,7 @@ class MainForm : Form
         }
         Log(">> 游戏已暂停, 开始执行表达式...");
 
+        bool sawWrong = false, sawOther = false;
         for (int st = 2; st <= 10; st++)
         {
             string id = (cb++).ToString();
@@ -1060,6 +1145,8 @@ class MainForm : Form
                     try { val = Encoding.UTF8.GetString(Convert.FromBase64String(val)); }
                     catch { }
                 }
+                if (val.IndexOf("输入了错误的变量信息") >= 0) sawWrong = true;
+                else sawOther = true;
             }
             if (isSuc == "true" || isSuc == "\"true\"")
             {
@@ -1077,6 +1164,8 @@ class MainForm : Form
         string c2 = (cb++).ToString();
         Send("{\"cmd\":\"continue\",\"callbackId\":\"" + c2 + "\",\"info\":{}}");
         Log("!! 执行失败 (所有 stackId 均未成功), 游戏已恢复运行; 详情见 TkLuaGUI.log");
+        if (sawWrong && !sawOther)
+            Log("!! 提示: 游戏环境尚未初始化(刚开新档/还没打开过面板), 请在游戏里加载存档并打开一次面板后再点按钮");
         return null;
     }
 
